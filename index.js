@@ -2,8 +2,9 @@ const express = require('express');
 const { requestUserPresence, presence, connectWebSocket, isUserInGuild } = require('./ws');
 const WebSocket = require('ws');
 const userCache = new Map();
+const fetch = require('node-fetch');
 require('dotenv').config();
-const fetch = require('node-fetch'); // Required for fullData()
+
 
 const app = express();
 const port = process.env.PORT || 10000;
