@@ -2,7 +2,6 @@ const express = require('express');
 const { requestUserPresence, presence, connectWebSocket, isUserInGuild } = require('./ws');
 const WebSocket = require('ws');
 const userCache = new Map();
-const fetch = require('node-fetch');
 require('dotenv').config();
 
 const app = express();
@@ -81,17 +80,15 @@ wss.on('connection', (ws) => {
         }
         console.log(`Connection Closed`);
     });
-});
+});    
 
 function broadcastUpdate(data) {
     const userId = data.user.id;
-    if (userSubscriptions[userId]) {
-        userSubscriptions[userId].forEach((ws) => {
-            if (ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ type: 'update', data }));
-            }
-        });
-    }
+    userSubscriptions[userId].forEach((ws) => {
+        if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'update', data }));
+        }
+    });
 }
 
 function sendPresenceData(data) {
@@ -109,9 +106,14 @@ function capitalizeFirstChar(str) {
     return str.charAt(0).toUpperCase() + str.slice(1);
 }
 
+
+
+
+
 async function fullData(data) {
-    const userId = data.user.id;
-    let user;
+   const userId = data.user.id;
+   let user;
+
 
     // Check if the user data is cached and is still valid (less than 5 minutes old)
     if (userCache.has(userId)) {
@@ -121,29 +123,55 @@ async function fullData(data) {
             user = cachedData.data;
         }
     } else {
-        try {
-            const res = await fetch(`https://discord.com/api/v9/users/${userId}/profile`, {
-                headers: { authorization: `Bot ${process.env.ACCTOKEN}` }
-            });
+    const data = await (await fetch(`https://discord.com/api/v9/users/${userId}/profile`, {
+        headers: { authorization: process.env.ACCTOKEN }
+    })).json();
+    const currentTime = Date.now();
 
-            if (!res.ok) {
-                throw new Error(`Failed to fetch profile: ${res.statusText}`);
-            }
+    delete data.mutual_guilds;
+    delete data.guild_badges;
 
-            const data = await res.json();
-            const currentTime = Date.now();
-
-            delete data.mutual_guilds;
-            delete data.guild_badges;
-
-            userCache.set(userId, { data, timestamp: currentTime });
-            user = data;
-        } catch (error) {
-            console.error("🔴 Error fetching user profile:", error);
-            user = { user: { id: userId }, status: 'offline', client_status: { desktop: 'offline' }, activities: [] };
-        }
+    userCache.set(userId, { data, timestamp: currentTime });
+    user = data;
     }
 
+
+    try {
+        const clientStatus = Object.keys(data.client_status).length === 0 ? lastOnlineData[userId] : data.client_status;
+
+        Object.keys(clientStatus).forEach(platform => {
+            let status = data.client_status[platform];
+            const statusColors = {
+                idle: "#f0b232",
+                dnd: "#f23f43",
+                online: "#23a55a",
+                offline: "#80848e",
+                streaming: "#593695"
+            };
+
+            user.badges.push({
+                id: platform,
+                description: (status === "offline" || !status) ? `Last Online From ${capitalizeFirstChar(platform)}` : `Online From ${capitalizeFirstChar(platform)}`,
+                status: status || "offline",
+                color: statusColors[status] || "#80848e",
+            });
+        });
+        user.status = data.status || "offline";
+        user.activities = data.activities;
+    } catch (e) {
+        if (!process.env.WEBHOOK) return;
+        const embed = {
+            title: "Error Fetching User Profile",
+            color: 16711680,
+            description: `Hey <@&${process.env.SUPPORTROLE}>, Please Check Why <@${userId}> is getting the below error...\n\`\`\`json\n${e}\`\`\``
+        };
+
+        await fetch(process.env.WEBHOOK, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ embeds: [embed] })
+        });
+    }
     return user;
 }
 
