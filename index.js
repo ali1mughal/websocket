@@ -3,6 +3,7 @@ const { requestUserPresence, presence, connectWebSocket, isUserInGuild } = requi
 const WebSocket = require('ws');
 const userCache = new Map();
 require('dotenv').config();
+const fetch = require('node-fetch'); // Required for fullData()
 
 const app = express();
 const port = process.env.PORT || 10000;
@@ -22,7 +23,7 @@ const offline = {};
 
 connectWebSocket();
 
-// Handle presence updates
+// Listen for presence updates from Discord
 presence.on('update', async (data) => {
     if (!data?.user?.id) return;
     lastOnlinePlatform(data);
@@ -32,12 +33,15 @@ presence.on('update', async (data) => {
     }
 });
 
-// Handle presence requests
+// Listen when presence data is retrieved
 presence.on('get', async ({ data, userId }) => {
+    console.log(`📥 presence:get triggered for userId: ${userId}`);
     if (data?.user?.id) {
+        console.log('✅ Got live presence data');
         sendPresenceData(await fullData(data));
         lastOnlinePlatform(data);
     } else {
+        console.log('⚠️ No live presence, using offline fallback');
         const fallback = offline[userId] || {
             user: { id: userId },
             status: 'offline',
@@ -48,7 +52,7 @@ presence.on('get', async ({ data, userId }) => {
     }
 });
 
-// WebSocket connection handler
+// Handle new WebSocket connections
 wss.on('connection', (ws) => {
     if (wss.clients.size > 10) {
         ws.send(JSON.stringify({ type: 'error', message: 'Server busy. Max 10 users allowed at once.' }));
@@ -81,6 +85,7 @@ wss.on('connection', (ws) => {
                     ws.close(4001, `User Not In Our Server: ${process.env.INVITE}`));
             }
 
+            // Subscribe and send data immediately
             requestUserPresence(userId);
 
             if (!userSubscriptions[userId]) {
@@ -88,27 +93,39 @@ wss.on('connection', (ws) => {
             }
 
             userSubscriptions[userId].push(ws);
-            console.log(`Subscribed to user ${userId}`);
+            console.log(`✅ Subscribed to user ${userId}`);
+
+            // Send current cached or offline data immediately
+            const fallback = offline[userId] || {
+                user: { id: userId },
+                status: 'offline',
+                client_status: { desktop: 'offline' },
+                activities: []
+            };
+            const enriched = await fullData(fallback);
+            ws.send(JSON.stringify({ type: 'get', data: enriched }));
         }
     });
 
     ws.on('close', () => {
         for (const userId in userSubscriptions) {
-            const userClients = userSubscriptions[userId];
-            if (userClients.includes(ws)) {
-                userSubscriptions[userId] = userClients.filter(client => client !== ws);
-                userCache.delete(userId);
+            const clients = userSubscriptions[userId];
+            if (clients.includes(ws)) {
+                userSubscriptions[userId] = clients.filter(client => client !== ws);
+                if (userSubscriptions[userId].length === 0) {
+                    userCache.delete(userId);
+                }
             }
         }
         console.log(`Connection Closed`);
     });
 });
 
-// Broadcast updated presence data
+// Broadcast update to all subscribed sockets
 function broadcastUpdate(data) {
     if (!data?.user?.id) return;
-
     const userId = data.user.id;
+
     if (userSubscriptions[userId]) {
         userSubscriptions[userId].forEach((ws) => {
             if (ws.readyState === WebSocket.OPEN) {
@@ -118,11 +135,16 @@ function broadcastUpdate(data) {
     }
 }
 
-// Send presence data to subscribers
+// Send presence data to all sockets watching this user
 function sendPresenceData(data) {
-    if (!data?.user?.id) return;
+    if (!data?.user?.id) {
+        console.log('❌ Cannot send presence: missing user ID');
+        return;
+    }
 
     const userId = data.user.id;
+    console.log(`📤 Sending presence to subscribers of ${userId}`);
+
     if (userSubscriptions[userId]) {
         userSubscriptions[userId].forEach((ws) => {
             if (ws.readyState === WebSocket.OPEN) {
@@ -132,12 +154,7 @@ function sendPresenceData(data) {
     }
 }
 
-// Capitalize first letter helper
-function capitalizeFirstChar(str) {
-    return str.charAt(0).toUpperCase() + str.slice(1);
-}
-
-// Fetch full user data and enrich it
+// Fetch full user profile and enrich it with status badges
 async function fullData(data) {
     if (!data?.user?.id) {
         throw new Error('Invalid data received in fullData');
@@ -147,33 +164,33 @@ async function fullData(data) {
     let user;
 
     if (userCache.has(userId)) {
-        const cachedData = userCache.get(userId);
-        const currentTime = Date.now();
-        if (currentTime - cachedData.timestamp < 5 * 60 * 1000) {
-            user = cachedData.data;
+        const cached = userCache.get(userId);
+        const now = Date.now();
+        if (now - cached.timestamp < 5 * 60 * 1000) {
+            user = cached.data;
         }
     }
 
     if (!user) {
-        const profileData = await (await fetch(`https://discord.com/api/v9/users/${userId}/profile`, {
+        const res = await fetch(`https://discord.com/api/v9/users/${userId}/profile`, {
             headers: { authorization: process.env.ACCTOKEN }
-        })).json();
+        });
+        const profileData = await res.json();
 
-        const currentTime = Date.now();
         delete profileData.mutual_guilds;
         delete profileData.guild_badges;
 
-        userCache.set(userId, { data: profileData, timestamp: currentTime });
+        const timestamp = Date.now();
+        userCache.set(userId, { data: profileData, timestamp });
         user = profileData;
     }
 
     try {
         const clientStatus = Object.keys(data.client_status || {}).length === 0 ? lastOnlineData[userId] : data.client_status;
-
         user.badges = [];
 
         Object.keys(clientStatus || {}).forEach(platform => {
-            let status = data.client_status[platform];
+            const status = data.client_status?.[platform] || "offline";
             const statusColors = {
                 idle: "#f0b232",
                 dnd: "#f23f43",
@@ -184,23 +201,22 @@ async function fullData(data) {
 
             user.badges.push({
                 id: platform,
-                description: (status === "offline" || !status)
-                    ? `Last Online From ${capitalizeFirstChar(platform)}`
-                    : `Online From ${capitalizeFirstChar(platform)}`,
-                status: status || "offline",
+                description: (status === "offline" ? `Last Online From ` : `Online From `) + capitalizeFirstChar(platform),
+                status,
                 color: statusColors[status] || "#80848e"
             });
         });
 
         user.status = data.status || "offline";
         user.activities = data.activities || [];
-    } catch (e) {
+    } catch (err) {
+        console.error("🔴 Error enriching user:", err);
         if (!process.env.WEBHOOK) return;
 
         const embed = {
             title: "Error Fetching User Profile",
             color: 16711680,
-            description: `Hey <@&${process.env.SUPPORTROLE}>, Please Check Why <@${userId}> is getting the below error...\n\`\`\`json\n${e}\`\`\``
+            description: `Hey <@&${process.env.SUPPORTROLE}>, please check why <@${userId}> is causing this:\n\`\`\`json\n${err}\`\`\``
         };
 
         await fetch(process.env.WEBHOOK, {
@@ -213,7 +229,7 @@ async function fullData(data) {
     return user;
 }
 
-// Track last online platform
+// Track user's last online platform
 function lastOnlinePlatform(data) {
     if (!data?.user?.id) return;
 
@@ -231,4 +247,8 @@ function lastOnlinePlatform(data) {
             activities: []
         };
     }
+}
+
+function capitalizeFirstChar(str) {
+    return str.charAt(0).toUpperCase() + str.slice(1);
 }
